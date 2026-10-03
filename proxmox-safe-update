@@ -1,0 +1,305 @@
+#!/usr/bin/env bash
+
+# Supervised in-release maintenance. A passing plan is not a rollback guarantee.
+set -Eeuo pipefail
+readonly SCRIPT_NAME=proxmox-safe-update VERSION=1.1.1
+readonly MIN_ROOT_FREE_BYTES="${MIN_ROOT_FREE_BYTES:-2147483648}" MIN_ROOT_FREE_PERCENT="${MIN_ROOT_FREE_PERCENT:-10}"
+VERBOSE=false
+CHECK_ONLY=false
+APT_LOG=
+SIM=
+RESIM=
+cleanup() {
+    [[ -z "$APT_LOG" ]] || rm -f -- "$APT_LOG"
+    [[ -z "$SIM" ]] || rm -f -- "$SIM"
+    [[ -z "$RESIM" ]] || rm -f -- "$RESIM"
+    return 0
+}
+trap cleanup EXIT
+
+# Temporary output is private (mktemp defaults) and removed by the EXIT trap.
+usage() {
+    printf 'Usage: %s [--check] [--verbose] [--help] [--version]\n' "$SCRIPT_NAME"
+    printf '  --check    Refresh APT indexes and inspect the plan; install nothing\n'
+    printf '  --verbose  Show complete APT output\n'
+}
+section() {
+    printf '\n%s\n' "$1"
+}
+ok() {
+    printf '  [OK] %s\n' "$*"
+}
+warn() {
+    printf '  [!] %s\n' "$*"
+}
+fail() {
+    printf '  [ERROR] %s\n' "$*" >&2
+    exit 1
+}
+apt_logged() {
+    local -a statuses
+    if [[ "$VERBOSE" == true ]]; then
+        if "$@" 2>&1 | tee -a "$APT_LOG"; then
+            return 0
+        else
+            statuses=("${PIPESTATUS[@]}")
+            ((statuses[0] == 0)) || return "${statuses[0]}"
+            return "${statuses[1]}"
+        fi
+    fi
+    "$@" >>"$APT_LOG" 2>&1 || {
+        tail -n 80 "$APT_LOG" >&2 || :
+        return 1
+    }
+}
+audit() {
+    local o
+    o="$(dpkg --audit 2>&1)" || {
+        printf '%s\n' "$o"
+        return 1
+    }
+    [[ -z "$o" ]] || {
+        printf '%s\n' "$o"
+        return 1
+    }
+}
+latest_kernel() {
+    find /boot -maxdepth 1 -type f -name 'vmlinuz-*-pve' -printf '%f\n' 2>/dev/null | sed 's/^vmlinuz-//' | sort -V | tail -1
+}
+newer_kernel() {
+    [[ -n "$2" && "$1" != "$2" && "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" == "$2" ]]
+}
+vms() {
+    qm list 2>/dev/null | awk 'NR>1{print $1"\t"$3}' | sort -n
+}
+lxcs() {
+    pct list 2>/dev/null | awk 'NR>1{print $1"\t"tolower($2)}' | sort -n
+}
+guest_summary() {
+    local t r s o
+    t="$(awk 'NF{n++}END{print n+0}' <<<"$1")"
+    r="$(awk '$2=="running"{n++}END{print n+0}' <<<"$1")"
+    s="$(awk '$2=="stopped"{n++}END{print n+0}' <<<"$1")"
+    o=$((t - r - s))
+    printf '%s running / %s stopped' "$r" "$s"
+    ((o == 0)) || printf ' / %s other' "$o"
+}
+guest_changes() {
+    local kind="$1" before="$2" after="$3" id status changed=false
+    declare -A old=() new=()
+    while read -r id status; do
+        [[ -z "${id:-}" ]] || old["$id"]="$status"
+    done <<<"$before"
+    while read -r id status; do
+        [[ -z "${id:-}" ]] || new["$id"]="$status"
+    done <<<"$after"
+    if ((${#old[@]} == 0 && ${#new[@]} == 0)); then
+        ok "No $kind guests configured"
+        return
+    fi
+    for id in $(printf '%s\n' "${!old[@]}" "${!new[@]}" | sed '/^$/d' | sort -nu); do
+        if [[ -z "${old[$id]+x}" ]]; then
+            warn "$kind $id appeared: ${new[$id]}"
+            changed=true
+        elif [[ -z "${new[$id]+x}" ]]; then
+            warn "$kind $id missing (was ${old[$id]})"
+            changed=true
+        elif [[ "${old[$id]}" == "${new[$id]}" ]]; then
+            ok "$kind $id: ${old[$id]} -> ${new[$id]}"
+        else
+            warn "$kind $id: ${old[$id]} -> ${new[$id]}"
+            changed=true
+        fi
+    done
+    [[ "$changed" == false ]]
+}
+
+# Only compare package actions; repository progress noise is not part of a plan.
+summary() {
+    sed -nE 's/^([0-9]+) upgraded, ([0-9]+) newly installed, ([0-9]+) to remove and ([0-9]+) not upgraded\.?$/\1 \2 \3 \4/p' "$1" | tail -1
+}
+fingerprint() {
+    awk '$1=="Inst"||$1=="Remv"||$1=="Conf"{print}' "$1" | sha256sum | awk '{print $1}'
+}
+for a; do case "$a" in --check) CHECK_ONLY=true ;; --verbose) VERBOSE=true ;; --help)
+    usage
+    exit
+    ;;
+--version)
+    echo "$SCRIPT_NAME $VERSION"
+    exit
+    ;;
+*)
+    usage >&2
+    exit 2
+    ;;
+esac done
+export LC_ALL=C DEBIAN_FRONTEND=readline
+printf '%s\n%s\n%s\n' '============================================================' '                    PROXMOX SAFE UPDATE' '============================================================'
+section PRE-CHECKS
+((EUID == 0)) || fail "This script must be run as root."
+ok "Root privileges"
+[[ "$MIN_ROOT_FREE_BYTES" =~ ^[0-9]{1,15}$ && "$MIN_ROOT_FREE_PERCENT" =~ ^[0-9]{1,2}$ ]] ||
+    fail "Free-space thresholds must be nonnegative decimal integers (percent 0-99)."
+# Decimal conversion prevents leading-zero values being interpreted as octal.
+min_bytes=$((10#$MIN_ROOT_FREE_BYTES))
+min_percent=$((10#$MIN_ROOT_FREE_PERCENT))
+for c in apt-get dpkg dpkg-query df find fuser pveversion qm pct sed sort tail tee awk mktemp sha256sum grep; do
+    command -v "$c" >/dev/null || fail "Required command is missing: $c"
+done
+ok "Proxmox VE detected"
+[[ "$(dpkg-query -W -f='${Status}' proxmox-ve 2>/dev/null || :)" == 'install ok installed' ]] || fail "proxmox-ve meta-package is not installed."
+ok "proxmox-ve meta-package installed"
+locks=(/var/lib/dpkg/lock /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock)
+# This is a point-in-time check. APT still enforces its own transaction locks.
+fuser "${locks[@]}" >/dev/null 2>&1 && fail "Another package operation holds an APT/dpkg lock."
+ok "No active APT/dpkg lock holder"
+ao="$(audit)" || {
+    printf '%s\n' "$ao" >&2
+    fail "Package database contains incomplete operations."
+}
+ok "dpkg database clean"
+avail="$(df -B1 --output=avail / | awk 'NR==2{print $1}')"
+used="$(df -P / | awk 'NR==2{gsub(/%/,"",$5);print $5}')"
+human="$(df -h --output=avail / | awk 'NR==2{print $1}')"
+[[ "$avail" =~ ^[0-9]+$ && "$used" =~ ^[0-9]+$ ]] || fail "Could not read root filesystem space."
+free=$((100 - used))
+((avail >= min_bytes && free >= min_percent)) || fail "Root filesystem has insufficient free space."
+ok "Root filesystem space"
+pv="$(pveversion | sed -n 's#^pve-manager/\([^/]*\)/.*#\1#p')"
+[[ -n "$pv" ]] || pv="$(pveversion)"
+running="$(uname -r)"
+vb="$(vms)" || fail "Could not read VM status."
+lb="$(lxcs)" || fail "Could not read LXC status."
+section HOST
+printf '  Proxmox : %s\n  Kernel  : %s\n  Root FS : %s%% used | %s available\n  VMs     : %s\n  LXCs    : %s\n' "$pv" "$running" "$used" "$human" "$(guest_summary "$vb")" "$(guest_summary "$lb")"
+APT_LOG="$(mktemp /tmp/proxmox-safe-update.apt.XXXXXX)"
+SIM="$(mktemp /tmp/proxmox-safe-update.sim.XXXXXX)"
+RESIM="$(mktemp /tmp/proxmox-safe-update.resim.XXXXXX)"
+section APT
+apt_logged apt-get -o APT::Update::Error-Mode=any update || fail "Package indexes could not be refreshed."
+grep -Eq '(^E:|Failed to fetch|Some index files failed to download)' "$APT_LOG" && fail "APT reported a repository error."
+ok "Package indexes refreshed"
+apt-get -s full-upgrade >"$SIM" 2>&1 || fail "Full-upgrade simulation failed."
+[[ "$VERBOSE" == false ]] || cat "$SIM"
+line="$(summary "$SIM")"
+[[ -n "$line" ]] || fail "Could not parse APT simulation."
+read -r up ins rem held <<<"$line"
+mapfile -t removed < <(awk '$1=="Remv"{print $2}' "$SIM")
+mapfile -t installed < <(awk '$1=="Inst"{print $2}' "$SIM")
+ku=false
+for p in "${installed[@]}"; do
+    [[ "$p" == proxmox-kernel-* || "$p" == pve-kernel-* ]] && ku=true
+done
+section "UPGRADE PLAN"
+printf '  Upgrade : %s\n  Install : %s\n  Remove  : %s\n  Held    : %s\n  Kernel update detected: %s\n' "$up" "$ins" "$rem" "$held" "$([[ "$ku" == true ]] && echo YES || echo NO)"
+if ((rem)); then
+    printf '  Packages to remove:\n'
+    printf '    - %s\n' "${removed[@]}"
+fi
+section SAFETY
+for p in "${removed[@]}"; do
+    [[ "${p%%:*}" != proxmox-ve ]] || fail "APT plans to remove proxmox-ve."
+done
+ok "proxmox-ve preserved"
+critical='^(pve-manager|pve-cluster|pve-storage|pve-qemu-kvm|qemu-server|pve-container|pve-firewall|proxmox-firewall|libpve-storage-perl|libpve-access-control|corosync|openssh-server|ifupdown2|systemd|zfsutils-linux)$'
+bad=()
+for p in "${removed[@]}"; do
+    essential="$(dpkg-query -W -f='${Essential}' "$p" 2>/dev/null || :)"
+    [[ "${p%%:*}" =~ $critical || "$essential" == yes ]] && bad+=("$p")
+done
+((${#bad[@]} == 0)) || fail "APT plans to remove critical packages: ${bad[*]}"
+ok "No critical Proxmox or Essential packages removed"
+rkp="$(dpkg-query -S "/boot/vmlinuz-$running" 2>/dev/null | awk -F: 'NR==1{print $1}' || :)"
+for p in "${removed[@]}"; do
+    [[ (-n "$rkp" && "$p" == "$rkp") || "$p" == *"$running"* ]] && fail "APT plans to remove running kernel: $p"
+done
+ok "Running kernel preserved"
+ok "Simulation completed successfully"
+total=$((up + ins + rem))
+if ((total == 0)); then
+    if ((held > 0)); then
+        warn "$held package(s) held back; no actionable package changes."
+        exit 1
+    fi
+    printf '\nSystem is up to date.\n'
+    exit
+fi
+((rem == 0)) || warn "Review every package removal."
+((held == 0)) || warn "$held package(s) held back."
+if [[ "$CHECK_ONLY" == true ]]; then
+    printf '\n%s\n%s\n%s\n' '============================================================' '              CHECK COMPLETED - UPDATES AVAILABLE' '              No packages were changed.'
+    exit
+fi
+fp="$(fingerprint "$SIM")"
+printf '\nProceed with upgrade? [y/N]: '
+read -r answer || fail "No confirmation received. No packages were changed."
+case "$answer" in y | Y | yes | YES | Yes) ;; *)
+    echo 'Update cancelled. No packages were changed.'
+    exit
+    ;;
+esac
+apt-get -s full-upgrade >"$RESIM" 2>&1 || fail "Could not revalidate upgrade plan."
+# Do not silently install a different plan after the administrator's approval.
+[[ "$(summary "$RESIM")" == "$line" && "$(fingerprint "$RESIM")" == "$fp" ]] || fail "APT plan changed after confirmation. Run again."
+section UPGRADE
+apt_logged apt-get --assume-yes full-upgrade || fail "APT full-upgrade failed."
+ok "APT transaction completed"
+post=false
+section POST-CHECKS
+pa="$(audit)" || {
+    printf '%s\n' "$pa" >&2
+    warn "dpkg database contains incomplete operations"
+    post=true
+}
+[[ "$post" == true ]] || ok "dpkg database clean"
+apt-get -s full-upgrade >"$SIM" 2>&1 || {
+    warn "Could not check remaining packages"
+    post=true
+}
+remain="$(summary "$SIM")"
+if [[ -z "$remain" ]]; then
+    warn "Could not parse final APT status"
+    post=true
+else
+    read -r ru ri rr rh <<<"$remain"
+    if ((ru + ri + rr + rh == 0)); then
+        ok "No pending upgrades"
+    else
+        warn "Pending: upgrade=$ru install=$ri remove=$rr held=$rh"
+        post=true
+    fi
+fi
+va="$(vms)" || {
+    warn "Could not read VM status"
+    post=true
+    va=
+}
+la="$(lxcs)" || {
+    warn "Could not read LXC status"
+    post=true
+    la=
+}
+guest_changes VM "$vb" "$va" || post=true
+guest_changes LXC "$lb" "$la" || post=true
+section REBOOT
+# Latest installed is not necessarily the bootloader's pinned/default selection.
+newest="$(latest_kernel)"
+reboot=false
+[[ -e /run/reboot-required ]] && reboot=true
+newer_kernel "$running" "$newest" && reboot=true
+if [[ "$reboot" == true ]]; then
+    warn "Reboot required."
+    printf '      Running: %s\n      Newest installed: %s\n' "$running" "$newest"
+else
+    ok "No reboot requirement detected"
+fi
+printf '\n%s\n' '============================================================'
+if [[ "$post" == true ]]; then
+    echo '             UPDATE FINISHED WITH WARNINGS'
+    exit 1
+elif [[ "$reboot" == true ]]; then
+    echo '          UPDATE COMPLETED - REBOOT REQUIRED'
+else
+    echo '                    UPDATE COMPLETED'
+fi
